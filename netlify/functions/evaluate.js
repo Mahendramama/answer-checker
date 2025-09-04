@@ -1,51 +1,45 @@
-// netlify/functions/evaluate.js
-// Server-side strict UPSC/OPSC evaluation using OpenAI.
-// Expects JSON: { question, maxMarks, examType, timeLimit, texts: [{source,text}], images: [{mime,dataUrl}] }
-
+// netlify/functions/evaluate.mjs
 import OpenAI from "openai";
 
-export const config = {
-  path: "/.netlify/functions/evaluate",
-};
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-export default async (req, res) => {
+export async function handler(event) {
   try {
-    if (req.method !== "POST") return res.status(405).send("Method not allowed");
-    const body = await readJson(req);
-    const { question, maxMarks, examType, timeLimit, texts = [], images = [] } = body || {};
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: "Method not allowed" };
+    }
 
-    if (!question || !maxMarks) return res.status(400).send("Missing question or maxMarks");
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return { statusCode: 500, body: "OPENAI_API_KEY is not set" };
+    }
+    const client = new OpenAI({ apiKey });
 
-    // Build message content: prefer extracted text; append images for OCR when provided
-    const userContent = [];
+    const body = JSON.parse(event.body || "{}");
+    const { question, maxMarks, examType, timeLimit, texts = [], images = [] } = body;
 
-    userContent.push({
+    if (!question || !maxMarks) {
+      return { statusCode: 400, body: "Missing question or maxMarks" };
+    }
+
+    // Build user content (prefer extracted text; add images for OCR)
+    const userContent = [{
       type: "text",
       text:
         `Question:\n${question}\n\n` +
-        `Context:\n` +
-        `- Exam Type: ${examType || "GS"}\n` +
+        `Context:\n- Exam Type: ${examType || "GS"}\n` +
         (timeLimit ? `- Time Limit (mins): ${timeLimit}\n` : "") +
         `- Max Marks: ${maxMarks}\n\n` +
         `Candidate Answer (compiled text sections follow).`
-    });
+    }];
 
     if (texts.length) {
       const bigText = texts.map(t => `\n\n[Source: ${t.source || "unknown"}]\n${t.text}`).join("\n");
-      // Trim very long text to avoid runaway tokens
       const trimmed = bigText.length > 150000 ? bigText.slice(0, 150000) + "\n...[trimmed]" : bigText;
       userContent.push({ type: "text", text: trimmed });
     }
 
     if (images.length) {
-      // Append images for OCR where text extraction failed/scanned
       for (const img of images.slice(0, 12)) {
-        userContent.push({
-          type: "image_url",
-          image_url: { url: img.dataUrl } // data: URL from client
-        });
+        userContent.push({ type: "image_url", image_url: { url: img.dataUrl } });
       }
       userContent.push({ type: "text", text: "If images contain handwriting or printed text, perform OCR before evaluation." });
     }
@@ -54,21 +48,20 @@ export default async (req, res) => {
 You are a strict evaluator for UPSC/OPSC mains-style answers.
 
 INSTRUCTIONS (apply rigorously):
-- Assume zero grace: award marks only for content that is relevant, accurate, and well-structured.
-- Penalize factual errors, poor structure, generic filler, missing intro/conclusion, lack of subheadings, absence of examples/case laws/commissions, poor handwriting legibility (if OCR shows unclear text).
-- Require answer to address ALL parts of the question with logical flow and prioritization.
+- Award marks only for relevant, accurate, well-structured content.
+- Penalize factual errors, poor structure, filler, missing intro/conclusion, lack of examples/case laws/reports, weak presentation/legibility.
 
-RUBRIC (0–100; be strict):
+RUBRIC (0–100):
 - content_relevance_accuracy: 40
 - analysis_depth_linkages: 20
 - structure_intro_body_conclusion: 15
 - use_of_examples_cases_data_diagrams: 10
 - clarity_language_and_presentation: 10
-- value_add (keywords, committees, constitutional articles, recent reports): 5
+- value_add: 5
 
-OUTPUT: JSON ONLY with this schema:
+OUTPUT: JSON ONLY:
 {
-  "rawOutOf100": number,             // 0-100
+  "rawOutOf100": number,
   "rubric": {
     "content_relevance_accuracy": number,
     "analysis_depth_linkages": number,
@@ -77,16 +70,11 @@ OUTPUT: JSON ONLY with this schema:
     "clarity_language_and_presentation": number,
     "value_add": number
   },
-  "strengths": [string, ...],
-  "weaknesses": [string, ...],
-  "suggestions": [string, ...],
-  "inline_comments": [string, ...]   // numbered or section-tagged comments
+  "strengths": [string],
+  "weaknesses": [string],
+  "suggestions": [string],
+  "inline_comments": [string]
 }
-
-NOTES:
-- Ensure rubric subtotal equals rawOutOf100 (consistency check).
-- No prose outside JSON. No markdown. No extra keys.
-- Keep comments concise and actionable.
 `;
 
     const completion = await client.chat.completions.create({
@@ -99,14 +87,13 @@ NOTES:
       ],
     });
 
+    // Parse + scale
     const raw = completion.choices?.[0]?.message?.content || "{}";
     let parsed;
     try { parsed = JSON.parse(raw); } catch { parsed = {}; }
 
-    const rawOutOf100 = clampNumber(parsed.rawOutOf100, 0, 100);
-    const maxMarks = Number(body.maxMarks);
-    // scale 0–100 to 0–maxMarks
-    const totalScaled = Math.round((rawOutOf100 / 100) * maxMarks);
+    const rawOutOf100 = clamp(parsed.rawOutOf100, 0, 100);
+    const scaled = Math.round((rawOutOf100 / 100) * Number(maxMarks));
 
     const resp = {
       rawOutOf100,
@@ -115,31 +102,23 @@ NOTES:
       weaknesses: parsed.weaknesses || [],
       suggestions: parsed.suggestions || [],
       inline_comments: parsed.inline_comments || [],
-      totalScaled,
-      maxMarks
+      totalScaled: scaled,
+      maxMarks: Number(maxMarks)
     };
 
-    res.setHeader("Content-Type", "application/json");
-    return res.status(200).send(JSON.stringify(resp));
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(resp)
+    };
+
   } catch (err) {
     console.error(err);
-    return res.status(500).send(err?.message || "Internal error");
+    return { statusCode: 500, body: err?.message || "Internal error" };
   }
-};
-
-// ---------- helpers ----------
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", chunk => data += chunk);
-    req.on("end", () => {
-      try { resolve(JSON.parse(data || "{}")); }
-      catch (e) { reject(e); }
-    });
-    req.on("error", reject);
-  });
 }
-function clampNumber(n, min, max) {
+
+function clamp(n, min, max) {
   n = Number(n);
   if (Number.isNaN(n)) return min;
   return Math.max(min, Math.min(max, n));
