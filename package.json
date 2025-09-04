@@ -1,0 +1,14 @@
+{
+  "name": "upsc-opsc-evaluator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo 'no build step'",
+    "start": "netlify dev"
+  },
+  "dependencies": {
+    "openai": "^4.57.0"
+  },
+  "devDependencies": {}
+}
